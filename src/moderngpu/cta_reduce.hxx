@@ -17,15 +17,16 @@ struct shfl_reduce_t {
 
   template<typename op_t = plus_t<type_t> >
   MGPU_DEVICE type_t reduce(int lane, type_t x, int count, op_t op = op_t()) {
+    uint const full_mask = 0xffffffffu;
     if(count == group_size) { 
       iterate<num_passes>([&](int pass) {
         int offset = 1<< pass;
-        x = shfl_down_op(x, offset, op, group_size);
+        x = shfl_down_op(full_mask, x, offset, op, group_size);
       });
     } else {
       iterate<num_passes>([&](int pass) {
         int offset = 1<< pass;
-        type_t y = shfl_down(x, offset, group_size);
+        type_t y = shfl_down(full_mask, x, offset, group_size);
         if(lane + offset < count) x = op(x, y);
       });
     }

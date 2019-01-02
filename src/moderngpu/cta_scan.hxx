@@ -43,13 +43,13 @@ struct cta_scan_t {
   MGPU_DEVICE scan_result_t<type_t>
   scan(int tid, type_t x, storage_t& storage, int count = nt, op_t op = op_t(), 
     type_t init = type_t(), scan_type_t type = scan_type_exc) const {
-
+    uint const full_mask = 0xffffffffu;
     int warp = tid / warp_size;
 
     // Scan each warp using shfl_add.
     type_t warp_scan = x;
     iterate<s_log2(warp_size)>([&](int pass) {
-      warp_scan = shfl_up_op(warp_scan, 1<< pass, op, warp_size);
+      warp_scan = shfl_up_op(full_mask, warp_scan, 1<< pass, op, warp_size);
     });
 
     // Store the intra-warp scans.
@@ -62,9 +62,10 @@ struct cta_scan_t {
 
     // Scan the warp reductions.
     if(tid < num_warps) { 
+      uint const active_mask = full_mask >> (warp_size - num_warps);
       type_t cta_scan = storage.warps[tid];
       iterate<s_log2(num_warps)>([&](int pass) {
-        cta_scan = shfl_up_op(cta_scan, 1<< pass, op, num_warps);
+        cta_scan = shfl_up_op(active_mask, cta_scan, 1<< pass, op, num_warps);
       });
       storage.warps[tid] = cta_scan;
     }
@@ -191,17 +192,18 @@ struct cta_scan_t<nt, bool> {
     // Store the bit totals for each warp.
     int lane = (warp_size - 1) & tid;
     int warp = tid / warp_size;
-
-    int bits = __ballot(x);
+    uint const full_mask = 0xffffffffu;
+    int bits = __ballot_sync(full_mask, x);
     storage.warps[warp] = popc(bits);
     __syncthreads();
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
     if(tid < num_warps) {
       // Cooperative warp scan of partial reductions.
+      uint const active_mask = full_mask >> (warp_size - num_warps);
       int scan = storage.warps[tid];
       iterate<s_log2(num_warps)>([&](int i) {
-        scan = shfl_up_op(scan, 1<< i, plus_t<int>(), num_warps);
+        scan = shfl_up_op(active_mask, scan, 1<< i, plus_t<int>(), num_warps);
       });
       storage.warps[tid] = scan;
     }

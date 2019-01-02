@@ -143,7 +143,7 @@ MGPU_HOST_DEVICE unsigned umulhi(unsigned a, unsigned b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
 
 template<typename type_t>
-MGPU_DEVICE type_t shfl_up(type_t x, int offset, int width = warp_size) { 
+MGPU_DEVICE type_t shfl_up(uint mask, type_t x, int offset, int width = warp_size) { 
   enum { num_words = div_up(sizeof(type_t), sizeof(int)) };
   union {
     int x[num_words];
@@ -152,13 +152,14 @@ MGPU_DEVICE type_t shfl_up(type_t x, int offset, int width = warp_size) {
   u.t = x;
 
   iterate<num_words>([&](int i) {
-    u.x[i] = __shfl_up(u.x[i], offset, width);
+    u.x[i] = __shfl_up_sync(mask, u.x[i], offset, width);
   });
   return u.t;
 }
 
 template<typename type_t>
-MGPU_DEVICE type_t shfl_down(type_t x, int offset, int width = warp_size) { 
+MGPU_DEVICE type_t shfl_down(uint mask, type_t x, int offset, 
+                             int width = warp_size) { 
   enum { num_words = div_up(sizeof(type_t), sizeof(int)) };
   union {
     int x[num_words];
@@ -167,43 +168,42 @@ MGPU_DEVICE type_t shfl_down(type_t x, int offset, int width = warp_size) {
   u.t = x;
 
   iterate<num_words>([&](int i) {
-    u.x[i] = __shfl_down(u.x[i], offset, width);
+    u.x[i] = __shfl_down_sync(mask, u.x[i], offset, width);
   });
   return u.t;
 }
 
 template<typename type_t, typename op_t> 
-MGPU_DEVICE type_t shfl_up_op(type_t x, int offset, op_t op, 
-  int width = warp_size) {
+MGPU_DEVICE type_t shfl_up_op(uint mask, type_t x, int offset, op_t op, 
+                              int width = warp_size) {
 
-  type_t y = shfl_up(x, offset, width);
+  type_t y = shfl_up(mask, x, offset, width);
   int lane = (width - 1) & threadIdx.x;
   if(lane >= offset) x = op(x, y);
   return x;
 }
 
 template<typename type_t, typename op_t> 
-MGPU_DEVICE type_t shfl_down_op(type_t x, int offset, op_t op, 
-  int width = warp_size) {
-
-  type_t y = shfl_down(x, offset, width);
+MGPU_DEVICE type_t shfl_down_op(uint mask, type_t x, int offset, op_t op, 
+                                int width = warp_size) {
+  type_t y = shfl_down(mask, x, offset, width);
   int lane = (width - 1) & threadIdx.x;
   if(lane < width - offset) x = op(x, y);
   return x;
 }
 
 #define SHFL_OP_MACRO(dir, is_up, ptx_type, r, c_type, ptx_op, c_op) \
-MGPU_DEVICE inline c_type shfl_##dir##_op(c_type x, int offset, \
-  c_op<c_type> op, int width = warp_size) { \
+MGPU_DEVICE inline c_type shfl_##dir##_op(uint active_mask, c_type x, \
+  int offset, c_op<c_type> op, int width = warp_size) { \
   c_type result = c_type(); \
   int mask = (warp_size - width)<< 8 | (is_up ? 0 : (width - 1)); \
   asm( \
     "{.reg ."#ptx_type" r0;" \
     ".reg .pred p;" \
-    "shfl."#dir".b32 r0|p, %1, %2, %3;" \
-    "@p "#ptx_op"."#ptx_type" r0, r0, %4;" \
+    "shfl.sync."#dir".b32 r0|p, %1, %2, %3, %4;" \
+    "@p "#ptx_op"."#ptx_type" r0, r0, %5;" \
     "mov."#ptx_type" %0, r0; }" \
-    : "="#r(result) : #r(x), "r"(offset), "r"(mask), #r(x)); \
+    : "="#r(result) : #r(x), "r"(offset), "r"(mask), "r"(active_mask), #r(x)); \
   return result; \
 }
 
@@ -231,8 +231,8 @@ SHFL_OP_MACRO(down, false, f32, f, float, max, minimum_t)
 #undef SHFL_OP_MACRO
 
 #define SHFL_OP_64b_MACRO(dir, is_up, ptx_type, r, c_type, ptx_op, c_op) \
-MGPU_DEVICE inline c_type shfl_##dir##_op(c_type x, int offset, \
-  c_op<c_type> op, int width = warp_size) { \
+MGPU_DEVICE inline c_type shfl_##dir##_op(uint active_mask, c_type x, \
+  int offset, c_op<c_type> op, int width = warp_size) { \
   c_type result = c_type(); \
   int mask = (warp_size - width)<< 8 | (is_up ? 0 : (width - 1)); \
   asm( \
@@ -241,12 +241,12 @@ MGPU_DEVICE inline c_type shfl_##dir##_op(c_type x, int offset, \
     ".reg .u32 hi;" \
     ".reg .pred p;" \
     "mov.b64 {lo, hi}, %1;" \
-    "shfl."#dir".b32 lo|p, lo, %2, %3;" \
-    "shfl."#dir".b32 hi  , hi, %2, %3;" \
+    "shfl.sync."#dir".b32 lo|p, lo, %2, %3, %4;" \
+    "shfl.sync."#dir".b32 hi  , hi, %2, %3, %4;" \
     "mov.b64 r0, {lo, hi};" \
-    "@p "#ptx_op"."#ptx_type" r0, r0, %4;" \
+    "@p "#ptx_op"."#ptx_type" r0, r0, %5;" \
     "mov."#ptx_type" %0, r0; }" \
-    : "="#r(result) : #r(x), "r"(offset), "r"(mask), #r(x) \
+    : "="#r(result) : #r(x), "r"(offset), "r"(mask), "r"(active_mask), #r(x) \
   ); \
   return result; \
 }
